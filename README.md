@@ -1,70 +1,220 @@
-Sure — here’s the text from the image:
+# ARCHITECTURAL SPECIFICATION & IMPLEMENTATION GUIDE
 
-First, a framing point
+**Pattern:** API Façade in Agentic Account via AWS PrivateLink
 
-The two directions are not symmetric, and conflating them is where most designs go wrong.
+**Target Accounts:** `agent-ai` (Agentic Workload Account) | `vrm-sandbox` (Application / EKS Account)
 
-Outbound (App → Bedrock/AgentCore): Bedrock and AgentCore are AWS-managed regional API services. You do not need network connectivity between the two VPCs for this. The Application account calls bedrock-runtime / AgentCore APIs using credentials that grant access in the Agentic account. The control plane is IAM; the network layer only determines whether the traffic leaves your VPC.
+---
 
-Return path (AgentCore → App account): This is the direction that actually needs network plumbing. If your agents call tools, internal APIs, databases, or an AgentCore Gateway target that lives in the Application account, you need real connectivity — PrivateLink, TGW, or an authenticated public endpoint.
+## Executive Summary
 
-Most designs need one option from the outbound list and one from the return-path list.
+To achieve the maximum security posture, direct cross-account IAM permissions for Amazon Bedrock and AgentCore are eliminated from the Application account (`vrm-sandbox`). Instead, an API Façade (a lightweight proxy service) is deployed in the Agentic account (`agent-ai`) behind an internal Network Load Balancer (NLB) and exposed via an AWS PrivateLink Endpoint Service.
 
-⸻
+### Key Security Outcomes
 
-Most secure
+* **Zero Bedrock Credentials:** The `vrm-sandbox` account and its EKS workloads hold no direct `bedrock:*` permissions.
 
-Recommended: API façade in the Agentic account + PrivateLink, no Bedrock credentials in the Application account.
 
-•⁠  ⁠Agentic account runs an internal NLB (or private API Gateway) in front of a thin invocation service, exposed as a VPC Endpoint Service.
-•⁠  ⁠Application account creates an interface VPC endpoint pointing at it. Traffic never touches the internet; no route tables, no CIDR coordination, unidirectional by construction.
-•⁠  ⁠The Application account holds zero bedrock:InvokeModel permissions. The façade enforces model allow-lists, guardrails, prompt/response logging, token budgets, and tenant isolation in one place you control.
-•⁠  ⁠Endpoint policy restricted with aws:PrincipalOrgID; SCP on the Application account explicitly denying bedrock:* so drift is impossible.
+* **Centralized Governance:** Model allow-lists, token budget enforcement, guardrails, and audit logging are strictly managed by the Façade in `agent-ai`.
 
-Runner-up: cross-account AssumeRole + interface endpoints for bedrock-runtime and AgentCore. Cheaper and simpler, but the Application account now holds credentials capable of invoking models directly. Harden with a permissions boundary, sts:TagSession for tenant/app attribution, condition keys on model ARNs, and aws:SourceAccount / aws:PrincipalOrgID to close confused-deputy paths. Centralize CloudTrail and Bedrock model-invocation logs to a third (log archive) account so neither workload account can tamper with its own audit trail.
 
-Avoid for this pattern: VPC peering or Transit Gateway as the primary answer. They grant broad bidirectional network reachability you don’t need for an API call, and they make the “Agentic account is a blast-radius boundary” claim much harder to defend.
+* **Network Isolation:** Traffic flows purely over the AWS private network backbone via PrivateLink interface endpoints—no public internet, no route table sharing, and no broad VPC peering.
 
-⸻
 
-Most cost efficient
 
-Recommended: cross-account AssumeRole over the public service endpoints, via an existing NAT/egress path — or async decoupling via SQS/EventBridge.
+---
 
-Sure — text from this image:
+## Architecture Diagram
 
-Most cost efficient
+```
++----------------------------------------------------------------------------------------------------------------+
+|                                           AWS ACCOUNT: vrm-sandbox                                             |
+|                                                                                                                |
+|  +----------------------------------------------------------------------------------------------------------+  |
+|  | VPC (App / EKS VPC)                                                                                      |  |
+|  |                                                                                                          |  |
+|  |   +--------------------------+                         +---------------------------------------------+   |  |
+|  |   | EKS Cluster              |                         | Interface VPC Endpoint                      |   |  |
+|  |   |  (Pods / Microservices)  |                         | (vpce-xxxxxx)                               |   |  |
+|  |   |                          |                         |  - Private IP in Subnets                    |   |  |
+|  |   | Calls Façade API over    |========================>|  - Private DNS: agent-ai.internal.local    |   |  |
+|  |   | local private IP/DNS     |  (Strictly Private)     +----------------------+----------------------+   |  |
+|  |   +--------------------------+                                                |                         |  |
+|  +-------------------------------------------------------------------------------|--------------------------+  |
++----------------------------------------------------------------------------------|-----------------------------+
+                                                                                   |
+                                                 AWS PrivateLink Connection        | (No Public Internet)
+                                                 (Unidirectional Security Boundary)|
+                                                                                   v
++----------------------------------------------------------------------------------------------------------------+
+|                                           AWS ACCOUNT: agent-ai                                                |
+|                                                                                                                |
+|  +----------------------------------------------------------------------------------------------------------+  |
+|  | VPC (Agentic / Infra VPC)                                                                                |  |
+|  |                                                                                                          |  |
+|  |   +--------------------------+       +-------------------+       +-----------------------------------+   |  |
+|  |   | VPC Endpoint Service     |<======| Network Load      |<======| Invocation Service Façade         |   |  |
+|  |   | (com.amazonaws.vpce...)  |       | Balancer (NLB)    |       | (ECS Fargate / Private API GW)    |   |  |
+|  |   +--------------------------+       +-------------------+       +-----------------+-----------------+   |  |
+|  |                                                                                    |                     |  |
+|  |                                                                                    | Attaches Agent      |  |
+|  |                                                                                    | Execution Role      |  |
+|  |                                                                                    v                     |  |
+|  |                                                                  +-----------------------------------+   |  |
+|  |                                                                  | AWS Bedrock / AgentCore           |   |  |
+|  |                                                                  | - Guardrails & Token Controls     |   |  |
+|  |                                                                  | - Agent Execution Runtime         |   |  |
+|  |                                                                  +-----------------------------------+   |  |
+|  +----------------------------------------------------------------------------------------------------------+  |
++----------------------------------------------------------------------------------------------------------------+
 
-Recommended: cross-account AssumeRole over the public service endpoints, via an existing NAT/egress path — or async decoupling via SQS/EventBridge.
+```
 
-•⁠  ⁠STS AssumeRole and cross-account IAM are free. No endpoint-hours, no attachment fees, no data processing charges.
-•⁠  ⁠Bedrock token spend is identical regardless of account topology, and it will dominate your bill. Optimizing $20/month of endpoint cost while ignoring token routing is the wrong fight.
-•⁠  ⁠For non-interactive workloads (batch enrichment, document processing, long-running agent tasks), a cross-account SQS queue or EventBridge bus is close to free at typical volumes, adds retry/DLQ for free, and eliminates the synchronous timeout problems that plague long agent invocations.
+---
 
-The real cost trap: if your Application account traffic currently leaves via NAT Gateway, that’s roughly $0.045/hr plus $0.045/GB processed. A VPC interface endpoint (~$0.01/hr per AZ plus ~$0.01/GB) becomes cheaper than NAT once you have meaningful volume — so the more secure option is often also the cheaper one. Run the math on your actual GB/month before assuming otherwise.
+## Phase 1: Implementation Steps in `agent-ai` Account
 
-These figures are approximate, us-east-1, and change; verify against the current AWS pricing pages before committing to a design.
+### 1. Deploy the Façade Service
 
-⸻
+Deploy an internal proxy microservice using ECS Fargate, Lambda behind a VPC, or a Private REST API Gateway.
 
-Easiest to deploy
+**Required IAM Task Role Policy for the Façade (`agent-ai`):**
 
-Recommended: cross-account IAM role assumption, nothing else.
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockAgentCoreAccess",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock-agent-runtime:InvokeAgent"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
 
-1.⁠ ⁠Agentic account: create BedrockInvokerRole with a trust policy naming the Application account (or aws:PrincipalOrgID), and a permissions policy scoped to specific model and AgentCore runtime ARNs.
-2.⁠ ⁠Application account: attach sts:AssumeRole for that single role ARN to your task/Lambda/EKS execution role.
-3.⁠ ⁠Application code: assume the role, cache credentials, instantiate the Bedrock client with them. In EKS, IRSA/Pod Identity handles this natively; in Lambda and ECS it’s a few lines.
+```
 
-No VPCs, no endpoints, no DNS, no CIDR negotiation. Deployable in an afternoon and easy to reason about in Terraform.
+### 2. Configure Internal Network Load Balancer (NLB)
 
-The trade-off is that traffic uses public AWS endpoints (still TLS, still on the AWS backbone once it hits the edge) and the Application account holds usable Bedrock credentials.
+1. Navigate to **VPC Console** $\rightarrow$ **Target Groups** $\rightarrow$ Create a target group pointing to the Façade tasks/IPs on TCP port `443` or `80`.
+2. Create an **Internal Network Load Balancer (NLB)** in your private subnets.
 
-⸻
 
-What I’d actually recommend
+3. Add a listener forwarding traffic to the target group created above.
 
-Start with cross-account AssumeRole to unblock delivery, but write it behind an internal SDK/client wrapper from day one. Add interface VPC endpoints as soon as volume justifies it — usually cost-neutral or better against NAT. Migrate to the PrivateLink façade when you need centralized guardrails, per-tenant attribution, or an auditable claim that the Application account cannot invoke models directly.
+### 3. Provision VPC Endpoint Service (PrivateLink Provider)
 
-For the return path, use PrivateLink from the Agentic account into the Application account rather than TGW, unless you already run TGW as your standard network fabric.
+1. Go to **VPC Console** $\rightarrow$ **Endpoint Services** $\rightarrow$ **Create Endpoint Service**.
+2. Select the Internal NLB created in step 2.
 
-Two things to verify before you build: current cross-account support and any account-level constraints for the specific AgentCore components you plan to use (Runtime, Gateway, Memory, Identity, Browser/Code Interpreter), and whether the Bedrock resources you want to share — knowledge bases, guardrails, prompt management, provisioned throughput, etc. — support the exact cross-account pattern you’re designing.
+
+3. Enable **Acceptance required**.
+
+
+4. Under **Allowed Principals**, explicitly authorize the `vrm-sandbox` account:
+`arn:aws:iam::<VRM_SANDBOX_ACCOUNT_ID>:root`
+5. Copy the generated **Service Name** (e.g., `com.amazonaws.vpce.us-east-1.vpce-svc-xxxxxxxxxxxxxxxxx`).
+
+
+
+---
+
+## Phase 2: Implementation Steps in `vrm-sandbox` Account
+
+### 1. Apply Bedrock Explicit Deny Safeguard
+
+To guarantee zero drift or misuse, apply an IAM boundary or policy statement to all EKS execution/pod roles to explicitly block direct Bedrock access:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BlockDirectBedrockAccess",
+      "Effect": "Deny",
+      "Action": [
+        "bedrock:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+```
+
+### 2. Create Interface VPC Endpoint (Consumer)
+
+1. Navigate to **VPC Console** $\rightarrow$ **Endpoints** $\rightarrow$ **Create Endpoint**.
+2. Select **Other endpoint services**.
+3. Service Name: Paste the `com.amazonaws.vpce...` string from the `agent-ai` account. Click **Verify service**.
+
+
+4. Select your **EKS VPC** and private subnets.
+
+
+5. Security Group: Create/assign a Security Group that permits inbound port `443` traffic from your EKS worker node security group.
+
+### 3. Accept Endpoint Connection in `agent-ai` Account
+
+1. Switch back to the `agent-ai` AWS Console.
+2. Go to **VPC Console** $\rightarrow$ **Endpoint Services** $\rightarrow$ Select your endpoint service.
+
+
+3. Under **Endpoint connections**, select the pending request from `vrm-sandbox` and click **Accept endpoint connection request**.
+
+
+
+---
+
+## Phase 3: Application Code Integration
+
+EKS microservices do not need the standard AWS Bedrock SDK (`boto3`). Instead, pods make standard HTTP/REST requests to the local VPC Endpoint DNS/IP provisioned in Phase 2.
+
+### Python Code Snippet (EKS App Pod)
+
+```python
+import requests
+
+# Private Endpoint DNS created by PrivateLink in vrm-sandbox
+FACADE_ENDPOINT_URL = "https://vpce-xxxxxx.agent-ai.internal.local/v1/agent/invoke"
+
+def invoke_agent_facade(prompt: str, session_id: str):
+    payload = {
+        "prompt": prompt,
+        "session_id": session_id,
+        "client_app": "vrm-sandbox-eks"
+    }
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # Strictly private network call - no AWS credentials required in vrm-sandbox
+    response = requests.post(
+        FACADE_ENDPOINT_URL, 
+        json=payload, 
+        headers=headers, 
+        timeout=30
+    )
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"Invocation failed: {response.status_code} - {response.text}")
+
+```
+
+---
+
+## Verification & Auditing Checklist
+
+* [ ] **Credential Audit:** Confirm no Pod in `vrm-sandbox` possesses AWS credentials with `bedrock:*` or `bedrock-agent-runtime:*` permissions.
+
+
+* [ ] **Network Isolation:** Confirm the VPC Endpoint SG in `vrm-sandbox` only accepts traffic originating from EKS worker node security groups.
+* [ ] **Logging Centralization:** Ensure the Façade in `agent-ai` streams all prompt/response metadata, token usage, and caller identities to Amazon CloudWatch / S3 in a centralized log account.
