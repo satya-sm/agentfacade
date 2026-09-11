@@ -33,12 +33,12 @@ The target architecture proposes a **zero-trust, data-isolated AI execution sand
 
 | Architectural Aspect | Initial Façade Proposal (NLB + ECS Proxy)| Lead's Proposed Target |
 
-| **Inbound Path (App $\rightarrow$ AI)** | PrivateLink $\rightarrow$ NLB $\rightarrow$ ECS Façade App | Direct PrivateLink to native `com.amazonaws.us-east-1.bedrock-agentcore`<br> |
+| **Inbound Path (App $\rightarrow$ AI)** | PrivateLink $\rightarrow$ NLB $\rightarrow$ ECS Façade App | Direct PrivateLink to native `com.amazonaws.us-east-1.bedrock-agentcore`<br>|
 | **Return Path (AI $\rightarrow$ App Tools)** | PrivateLink or API Gateway | **AWS VPC Lattice Resource Gateway** (Shared via AWS RAM) |
-| **Tool Authorization** | Custom application logic inside proxy | **AgentCore Gateway Policy Engine (Cedar Rules)**<br> |
-| **State Management** | External DB or AgentCore Memory | **Zero Durable State** (AgentCore Memory explicitly rejected) |
-| **Tenant Isolation** | Evaluated at Façade application layer | **Run Token Scope:** Rails controls every read/write; model IDs are untrusted |
-| **Network Egress Guardrails** | Standard Security Groups | Deny-by-default egress, strict SCPs blocking IGW/NAT/peering |
+| **Tool Authorization** | Custom application logic inside proxy | **AgentCore Gateway Policy Engine (Cedar Rules)**<br>|
+| **State Management** | External DB or AgentCore Memory | **Zero Durable State** (AgentCore Memory explicitly rejected)|
+| **Tenant Isolation** | Evaluated at Façade application layer | **Run Token Scope:** Rails controls every read/write; model IDs are untrusted|
+| **Network Egress Guardrails** | Standard Security Groups | Deny-by-default egress, strict SCPs blocking IGW/NAT/peering|
 
 ---
 
