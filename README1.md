@@ -1,5 +1,5 @@
 
-# ARCHITECTURE REVIEW & COMPARATIVE ASSESSMENT: AAIS-001 v0.2
+# ARCHITECTURE REVIEW & COMPARATIVE ASSESSMENT
 
 **Target Accounts:** `vrm-sandbox` (App / EKS Account) | `vrm-ai` (Dedicated Agent Account / OU `ou-2qlc-c7r7zow1`)
 
@@ -29,11 +29,11 @@ The target architecture proposes a **zero-trust, data-isolated AI execution sand
 
 ---
 
-## 2. Architecture Comparison: Existing Façade Model vs. Target `AAIS-001 v0.2`
+## 2. Architecture Comparison: Existing Façade Model vs. Target 
 
 | Architectural Aspect | Initial Façade Proposal (NLB + ECS Proxy)
 
- | Lead's Proposed Target (`AAIS-001 v0.2`)
+ | Lead's Proposed Target
 
  |
 | --- | --- | --- |
